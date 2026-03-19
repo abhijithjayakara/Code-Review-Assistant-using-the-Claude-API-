@@ -1,0 +1,879 @@
+[
+  {
+    "file": "tool_use.py",
+    "score": 2,
+    "data": {
+      "score": 2,
+      "verdict": "REJECT",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "CRITICAL",
+          "location": "run_python() / handle_tool_call() calculate branch",
+          "description": "Arbitrary code execution vulnerability. The `run_python` tool executes any code Claude generates via subprocess with no sandboxing, and the `calculate` handler (visible from context) uses `eval()` on LLM-supplied expressions. A prompt-injection attack or a misbehaving model response could run destructive shell commands, exfiltrate data, or compromise the host machine.",
+          "fix": "For `run_python`, run code in an isolated Docker container or use a restricted executor (e.g., RestrictedPython, Pyodide). For `calculate`, replace `eval()` with a safe math parser such as `simpleeval` or `asteval`, and whitelist only numeric/math AST nodes. At minimum, add a user confirmation prompt before execution and restrict subprocess permissions."
+        },
+        {
+          "severity": "HIGH",
+          "location": "handle_tool_call() \u2014 calculate branch (line ~190+)",
+          "description": "The file is truncated mid-string inside `zoneinfo.ZoneInfo(inputs[\"` \u2014 the `calculate` branch and all subsequent logic is missing. This means Demo 3 is completely broken and will raise a SyntaxError at import/parse time, crashing the entire script before any demo runs.",
+          "fix": "Complete the `handle_tool_call` function: close the string literal, finish the `get_time` branch (e.g., `tz = zoneinfo.ZoneInfo(inputs[\"timezone\"]); return {\"time\": datetime.now(tz).isoformat()}`), add the `calculate` branch (e.g., `return {\"result\": eval(inputs[\"expression\"])}`), and add a fallback `else` clause raising `ValueError(f\"Unknown tool: {name}\")`."
+        },
+        {
+          "severity": "HIGH",
+          "location": "Demo 1, line ~79",
+          "description": "`result` is referenced in the `print(f\"Function returned: {result}\")` call and in the `tool_result` block, but it is only assigned inside the `if tool_name == \"get_weather\":` branch. If Claude returns a different tool name, `result` will be undefined, raising `UnboundLocalError`.",
+          "fix": "Add an `else` branch that raises `NotImplementedError(f\"Unhandled tool: {tool_name}\")` or initialise `result = None` before the conditional and guard subsequent code with `if result is not None:`."
+        },
+        {
+          "severity": "HIGH",
+          "location": "run_python(), line ~115",
+          "description": "`subprocess.TimeoutExpired` is caught but `subprocess.SubprocessError` and `OSError` (e.g., executable not found, permission denied) are not. Any OS-level failure propagates as an unhandled exception and crashes the demo.",
+          "fix": "Broaden the except clause: `except subprocess.TimeoutExpired: ...` then `except (subprocess.SubprocessError, OSError) as e: return {\"stdout\": \"\", \"stderr\": str(e), \"success\": False}`."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Demo 1 & Demo 2 \u2014 all `final_response.content[0].text` accesses",
+          "description": "The code assumes the final response always has at least one content block and that its type is `text`. If the model returns an empty content list or another block type (e.g., another `tool_use`), this raises `IndexError` or `AttributeError`.",
+          "fix": "Check before accessing: `text_block = next((b for b in final_response.content if b.type == 'text'), None); print(text_block.text if text_block else 'No text response')`."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "run_python(), line ~108",
+          "description": "`stderr` output from executed code is silently ignored when printing results (`print(f\"Code output: {result['stdout']}\")`). If Claude's generated code has errors, the user sees an empty stdout with no indication of failure, making debugging impossible.",
+          "fix": "After execution, check `result['success']` and print stderr when it is non-empty: `if not result['success'] or result['stderr']: print(f\"Code errors/warnings: {result['stderr']}\")`."
+        }
+      ],
+      "strengths": [
+        "Clear structure with well-separated demos that progressively introduce tool-use complexity.",
+        "Good use of `json.dumps` when serialising tool results back to the API instead of passing raw dicts.",
+        "Timeout handling in `run_python` shows awareness of runaway-code risk, even if incomplete.",
+        "Helpful inline comments explaining each step of the tool-use loop make the code readable as a tutorial."
+      ],
+      "one_line_summary": "The script has a critical arbitrary-code-execution vulnerability, a syntax error that prevents it from running at all, and multiple unhandled error paths that must be fixed before this code is safe or functional."
+    }
+  },
+  {
+    "file": "mcp_client.py",
+    "score": 3,
+    "data": {
+      "score": 3,
+      "verdict": "REJECT",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "CRITICAL",
+          "location": "handle_mcp_tool() \u2014 write_file branch",
+          "description": "Arbitrary file write with no path validation or sandboxing. Any path (including system files like /etc/passwd or C:\\Windows\\System32\\...) can be written to, since Claude controls the 'path' and 'content' inputs. Combined with an LLM driving the tool calls, this is a severe prompt-injection / path-traversal risk.",
+          "fix": "Define an ALLOWED_BASE_PATH (e.g. the project root) and resolve + validate every incoming path: resolved = os.path.realpath(path); assert resolved.startswith(os.path.realpath(ALLOWED_BASE_PATH)). Raise an error and return immediately if the assertion fails."
+        },
+        {
+          "severity": "CRITICAL",
+          "location": "handle_mcp_tool() \u2014 read_file branch",
+          "description": "Same path-traversal issue on reads. An adversarial prompt could instruct Claude to read sensitive files (SSH keys, .env files with secrets, etc.) anywhere on the filesystem, and the content is then sent to the Anthropic API.",
+          "fix": "Apply the same ALLOWED_BASE_PATH guard described above to the read_file branch before opening the file."
+        },
+        {
+          "severity": "HIGH",
+          "location": "run_mcp_conversation() \u2014 tool_use handling block, line ~175",
+          "description": "Tool results are silently truncated in the print statement ([:60]) but the full JSON is still sent to the API. More importantly, there is no limit on result size. A large file read could send megabytes of text to the model in a single tool_result, causing silent token-limit failures or unexpected API errors with no recovery logic.",
+          "fix": "Cap tool result content before embedding it: MAX_RESULT = 8000; content = json.dumps(result)[:MAX_RESULT]. Also wrap the client.messages.create() call in a try/except to surface API errors instead of crashing."
+        },
+        {
+          "severity": "HIGH",
+          "location": "run_mcp_conversation(), line ~155 \u2014 model name",
+          "description": "The model is hardcoded as 'claude-sonnet-4-6', which is not a valid/stable public model identifier. This will raise an API error at runtime and silently break every demo.",
+          "fix": "Use a valid, stable model identifier such as 'claude-3-5-sonnet-20241022' or read it from an environment variable: model=os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022')."
+        },
+        {
+          "severity": "HIGH",
+          "location": "handle_mcp_tool() \u2014 search_files branch, fnmatch import",
+          "description": "os.walk() with no depth limit on an arbitrary user-supplied path can recurse into enormous directory trees (e.g. a root drive), causing the process to hang or exhaust memory. node_modules is filtered, but there is no general guard.",
+          "fix": "Add a depth counter and a MAX_DEPTH constant (e.g. 5), and enforce a MAX_MATCHES limit (e.g. 500) so the walk terminates early: if len(matches) >= MAX_MATCHES: break."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Module-level \u2014 hardcoded Windows path on line ~195",
+          "description": "project_path = r'C:\\Users\\LENOVO\\claude-mastery' is a machine-specific absolute path that makes the script non-portable and will fail for every other developer.",
+          "fix": "Replace with a relative path or an environment variable: project_path = os.getenv('PROJECT_PATH', os.path.dirname(os.path.abspath(__file__)))."
+        }
+      ],
+      "strengths": [
+        "Clean separation between the tool-definition layer (mcp_filesystem_tools) and the execution layer (handle_mcp_tool), mirroring real MCP architecture.",
+        "Correct multi-turn agentic loop: assistant content is appended before tool results, and all tool_use blocks in a single turn are batched into one tool_result message.",
+        "Consistent error handling pattern (returning {'error': ...} dicts) prevents unhandled exceptions from crashing the loop mid-conversation.",
+        "UTF-8 encoding is explicitly set on all file I/O, avoiding silent mojibake bugs."
+      ],
+      "one_line_summary": "Two critical path-traversal vulnerabilities allow Claude (or an adversarial prompt) to read or overwrite arbitrary files on the host system, making this unsafe to run as-is."
+    }
+  },
+  {
+    "file": "tool_use.mjs",
+    "score": 3,
+    "data": {
+      "score": 3,
+      "verdict": "REJECT",
+      "language": "JavaScript (ESM / .mjs)",
+      "issues": [
+        {
+          "severity": "CRITICAL",
+          "location": "runPython() \u2014 line 76",
+          "description": "Arbitrary code execution via shell injection. The na\u00efve escaping `code.replace(/\"/g, '\\\\\"')` does not sanitize backticks, `$()`, single-quotes, newlines, or semicolons. Any LLM-generated code (or adversarial prompt) can break out of the double-quoted shell argument and run arbitrary OS commands on the host.",
+          "fix": "Never pass untrusted code through a shell string. Use `execSync` with an array-style spawn or write the code to a temp file: `const tmp = '/tmp/_claude_run.py'; fs.writeFileSync(tmp, code); const output = execSync(['python', tmp], {timeout:10000}).toString();` \u2014 or use `spawnSync('python', ['-c', code], {timeout:10000})` which bypasses the shell entirely."
+        },
+        {
+          "severity": "CRITICAL",
+          "location": "handleToolCall() \u2014 line 128",
+          "description": "`eval(inputs.expression)` executes arbitrary JavaScript in the current process. Claude (or a prompt-injected expression) could call `process.exit()`, read `process.env`, exfiltrate secrets, or crash the process.",
+          "fix": "Replace `eval` with a safe math-expression parser such as `mathjs` (`math.evaluate(inputs.expression)`) or implement a strict allowlist parser. Never eval LLM-supplied strings."
+        },
+        {
+          "severity": "HIGH",
+          "location": "DEMO 1 / DEMO 2 / DEMO 3 \u2014 all `final.content[0].text` accesses (lines 64, 108, 143)",
+          "description": "`final.content[0]` is accessed without checking that the array is non-empty or that the first element has `type === 'text'`. If the model returns a `tool_use` block as the first content item, or returns an empty content array (e.g. on a stop due to `max_tokens`), this throws `TypeError: Cannot read properties of undefined`.",
+          "fix": "Add a guard before each access: `const textBlock = final.content.find(b => b.type === 'text'); if (textBlock) console.log(textBlock.text); else console.warn('No text block in response', final.stop_reason);`"
+        },
+        {
+          "severity": "HIGH",
+          "location": "runPython() \u2014 line 76",
+          "description": "`execSync` with `timeout: 10000` still allows 10 seconds of CPU-intensive or fork-heavy Python. There is no memory cap, no sandboxing, and no cleanup of any side-effects (file writes, network calls) the generated code may cause.",
+          "fix": "Run the subprocess in an isolated environment (Docker container, `firejail`, or a cloud sandbox). At minimum add `{ maxBuffer: 1024 * 256, timeout: 5000 }` and consider running as a restricted OS user. Log and alert on non-zero exit codes."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Top-level `await` throughout \u2014 lines 42, 93, 104, 116, 135, 140",
+          "description": "All API calls and tool executions are top-level `await` with zero error handling. A network error, rate-limit (429), or API timeout will produce an unhandled rejection that terminates the process with no useful diagnostic.",
+          "fix": "Wrap each logical demo in an `async function demo1() { try { \u2026 } catch(e) { console.error('Demo 1 failed:', e); } }` and call them sequentially, or add a top-level `process.on('unhandledRejection', \u2026)` handler at minimum."
+        },
+        {
+          "severity": "LOW",
+          "location": "DEMO 2 \u2014 line 76 (`python` command)",
+          "description": "`python` may resolve to Python 2 on many systems; the intended runtime is almost certainly Python 3.",
+          "fix": "Use `python3` explicitly, or resolve the interpreter from an environment variable: `const py = process.env.PYTHON_BIN ?? 'python3';`"
+        }
+      ],
+      "strengths": [
+        "Clear section separation with console banners makes the demo easy to follow.",
+        "Fake weather data avoids real external HTTP calls, keeping Demo 1 deterministic.",
+        "Tool result is correctly threaded back into the conversation as a `tool_result` content block with the matching `tool_use_id`.",
+        "10-second timeout on `execSync` shows awareness of runaway processes, even if insufficient on its own."
+      ],
+      "one_line_summary": "Two critical remote-code-execution vulnerabilities (shell injection in runPython and eval in calculate) make this unsafe to run as-is; reject until both are replaced with sandboxed alternatives."
+    }
+  },
+  {
+    "file": "mcp_client.mjs",
+    "score": 3,
+    "data": {
+      "score": 3,
+      "verdict": "REJECT",
+      "language": "JavaScript (ESM / .mjs)",
+      "issues": [
+        {
+          "severity": "CRITICAL",
+          "location": "handleMcpTool() \u2014 read_file and list_directory branches",
+          "description": "No path sanitization or confinement: any path the LLM hallucinates or an adversary injects (e.g. '../../etc/passwd', 'C:\\Windows\\System32\\...') is passed directly to fs.readFileSync / fs.readdirSync. Because the AI model controls tool arguments, this is a prompt-injection / path-traversal attack surface that can exfiltrate arbitrary files or traverse outside PROJECT_PATH.",
+          "fix": "Resolve and validate every incoming path against an allowed root before I/O: `const safe = path.resolve(input.path); if (!safe.startsWith(path.resolve(PROJECT_PATH))) throw new Error('Path outside allowed root');`  Apply the same guard in all three tool branches."
+        },
+        {
+          "severity": "CRITICAL",
+          "location": "handleMcpTool() \u2014 write_file branch",
+          "description": "write_file has no path restriction either, and additionally calls fs.mkdirSync with { recursive: true }, meaning the model can create arbitrary directory trees and overwrite any file the Node process has write access to (including source files, credentials, etc.).",
+          "fix": "Apply the same path-confinement check described above before mkdirSync/writeFileSync. Also consider an explicit allowlist of writable sub-paths (e.g. only PROJECT_PATH/module6/) rather than the entire PROJECT_PATH tree."
+        },
+        {
+          "severity": "HIGH",
+          "location": "runMcpConversation() \u2014 tool_use branch, line ~97",
+          "description": "When stop_reason is neither 'end_turn' nor 'tool_use' (e.g. 'max_tokens', 'stop_sequence', API error surfaced as an unexpected value), the loop silently continues, incrementing turns and re-querying with an unchanged messages array, wasting tokens and potentially looping until maxTurns with no useful output.",
+          "fix": "Add an explicit else branch: `else { console.warn('Unexpected stop_reason:', response.stop_reason); break; }` and return a descriptive message, or throw, so the caller knows what happened."
+        },
+        {
+          "severity": "HIGH",
+          "location": "runMcpConversation() \u2014 top-level await calls (lines ~115, ~122)",
+          "description": "Neither runMcpConversation call is wrapped in try/catch. Any network error, API rate-limit, or auth failure from the Anthropic SDK will produce an unhandled promise rejection and crash the process with no diagnostics.",
+          "fix": "Wrap each call: `try { const answer1 = await runMcpConversation(...); ... } catch (err) { console.error('MCP conversation failed:', err); process.exit(1); }`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "PROJECT_PATH constant, line 6",
+          "description": "The absolute Windows path 'C:\\Users\\LENOVO\\claude-mastery' is hardcoded. This makes the script non-portable and leaks machine/username information in version control.",
+          "fix": "Replace with an environment variable: `const PROJECT_PATH = process.env.PROJECT_PATH ?? path.resolve('./claude-mastery');` and document the variable in a .env.example file."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "runMcpConversation() \u2014 line ~89 (model name string)",
+          "description": "The model identifier 'claude-sonnet-4-6' is a non-standard/unrecognized model slug (likely a typo for 'claude-sonnet-4-5' or 'claude-3-5-sonnet-20241022'). A wrong model name will cause a silent API error or use an unintended model.",
+          "fix": "Use the canonical model identifier from the Anthropic docs, e.g. `model: \"claude-3-5-sonnet-20241022\"`, and ideally pull it from a named constant or environment variable so it is easy to update."
+        }
+      ],
+      "strengths": [
+        "Agentic loop correctly appends both assistant tool-use content and user tool_result responses to the messages array, matching the Anthropic multi-turn tool-use protocol.",
+        "mkdirSync with { recursive: true } avoids a common 'directory does not exist' failure when writing nested paths.",
+        "Tool schemas are well-formed with explicit required arrays, giving the model clear guidance on required inputs."
+      ],
+      "one_line_summary": "Two critical path-traversal vulnerabilities (unsanitized LLM-controlled file paths) and missing error handling must be fixed before this code is safe to run."
+    }
+  },
+  {
+    "file": "first_call.py",
+    "score": 4,
+    "data": {
+      "score": 4,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "client.messages.create(), line 5",
+          "description": "No error handling for API call. Network failures, authentication errors, rate limits, or invalid model names will cause unhandled exceptions and crash the script.",
+          "fix": "Wrap the API call in a try/except block: try: response = client.messages.create(...) except anthropic.APIConnectionError as e: print('Connection error:', e) except anthropic.AuthenticationError as e: print('Auth error:', e) except anthropic.RateLimitError as e: print('Rate limit hit:', e) except anthropic.APIStatusError as e: print('API error:', e.status_code, e.message)"
+        },
+        {
+          "severity": "HIGH",
+          "location": "line 10, message content",
+          "description": "The prompt is grammatically malformed ('All things you can handel') and semantically misleading \u2014 the Claude API has no inherent access to any GitHub account. This will produce a confusing or hallucinated response without a system prompt clarifying the assistant's actual capabilities and scope.",
+          "fix": "Add a system prompt clarifying context and fix the user message: messages=[{'role': 'user', 'content': 'What GitHub-related tasks can you help me with via the API?'}] and add system='You are a helpful assistant. You do not have direct access to any GitHub account unless tools or integrations are explicitly provided.'"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "line 12, response.content[0].text",
+          "description": "Direct index access on response.content[0] without checking the list length or content block type. If the response returns an unexpected structure (e.g., tool_use blocks or empty content), this will raise an IndexError or AttributeError.",
+          "fix": "Guard with a check: if response.content and hasattr(response.content[0], 'text'): print(response.content[0].text) else: print('No text content in response.')"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "module level (no main guard)",
+          "description": "All code runs at module level with no if __name__ == '__main__': guard, making the script non-importable without side effects (immediate API call and charges).",
+          "fix": "Wrap all executable code in: if __name__ == '__main__': client = anthropic.Anthropic() ..."
+        },
+        {
+          "severity": "LOW",
+          "location": "line 5, model parameter",
+          "description": "The model name 'claude-sonnet-4-6' is hardcoded as a magic string. If the model is deprecated or renamed, there is no single place to update it.",
+          "fix": "Define a constant at the top: MODEL = 'claude-sonnet-4-6' and reference it as model=MODEL in the API call."
+        }
+      ],
+      "strengths": [
+        "Clean and minimal usage of the Anthropic SDK with correct basic structure",
+        "Good practice of printing usage metadata (input/output tokens and stop reason) for observability and cost tracking"
+      ],
+      "one_line_summary": "Functional but fragile proof-of-concept with no error handling, unsafe response access, a misleading prompt, and missing structural best practices."
+    }
+  },
+  {
+    "file": "my_mcp_server.py",
+    "score": 4,
+    "data": {
+      "score": 4,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "CRITICAL",
+          "location": "get_code_stats(), check_python_style(), summarize_directory()",
+          "description": "All three tools accept arbitrary file/directory paths with no validation or sandboxing. An LLM or malicious prompt injection could instruct the server to read any file on the system (e.g., /etc/passwd, ~/.ssh/id_rsa, or any secrets file), making this a significant data exfiltration risk in an MCP context.",
+          "fix": "Enforce an allowlist of permitted base directories. At minimum, resolve and validate that the path stays within an expected root: `base = Path('/safe/root').resolve(); target = Path(filepath).resolve(); assert target.is_relative_to(base)`. Raise a clear error (not a silent dict) if the path escapes the allowed root."
+        },
+        {
+          "severity": "HIGH",
+          "location": "get_code_stats(), check_python_style()",
+          "description": "Files are opened and read entirely into memory with no size limit. A tool caller could pass a multi-gigabyte file, causing an OOM condition or severe performance degradation in the MCP server process.",
+          "fix": "Add a file size guard before reading: `if os.path.getsize(filepath) > MAX_FILE_BYTES: return {'error': 'File too large'}`. A sensible limit is 1\u20135 MB for a code analysis tool."
+        },
+        {
+          "severity": "HIGH",
+          "location": "check_python_style(), line 57",
+          "description": "The trailing-whitespace check `if line != line.rstrip() + '\\n' and line.rstrip()` produces false negatives for the last line of a file if it has no newline, and false positives for blank lines that contain only a newline. The logic is fragile and incorrect for edge cases.",
+          "fix": "Use a simpler, correct check: `stripped = line.rstrip('\\n'); if stripped != stripped.rstrip(): issues.append(...)`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "summarize_directory()",
+          "description": "`import os` and `import fnmatch` are placed inside the function body. This is an antipattern: imports are cached after the first call but the placement is unconventional, reduces readability, and can mask missing-dependency issues until the function is first invoked.",
+          "fix": "Move both imports to the top of the module alongside the existing `from mcp.server.fastmcp import FastMCP` import."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "get_code_stats(), lines 29\u201332",
+          "description": "Function and import counting with simple `startswith` string matching is unreliable. It misses `async def`, multi-line imports, class methods with leading spaces at non-standard indentation, and produces incorrect counts for strings that happen to contain those patterns.",
+          "fix": "Use the `ast` module for accurate analysis: `tree = ast.parse(content); functions = sum(1 for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))); imports = sum(1 for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)))`."
+        },
+        {
+          "severity": "LOW",
+          "location": "check_python_style(), line 63",
+          "description": "Silently truncating the issues list to 10 with no indication that more exist can mislead the caller into thinking a file is nearly clean when it may have hundreds of violations.",
+          "fix": "Return the total count alongside the truncated list and add a flag: `'truncated': len(issues) > 10, 'issues': issues[:10], 'issues_found': len(issues)`."
+        }
+      ],
+      "strengths": [
+        "Clean use of the FastMCP decorator pattern \u2014 tool registration is concise and readable.",
+        "Exceptions are caught and returned as structured error dicts rather than crashing the server.",
+        "Directory traversal correctly prunes common noise directories (node_modules, __pycache__, .git)."
+      ],
+      "one_line_summary": "The server has a critical path-traversal vulnerability that exposes the entire filesystem to any tool caller, plus several reliability and correctness issues that must be resolved before deployment."
+    }
+  },
+  {
+    "file": "advanced_api.py",
+    "score": 5,
+    "data": {
+      "score": 5,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "Line ~195 (batch result processing block)",
+          "description": "The code is syntactically incomplete \u2014 the file is truncated mid-string literal (`print(\"\\nBatch complete! Fetching results.`), meaning it will raise a SyntaxError and never run. Any result processing, error handling, or cleanup after the batch completes is missing entirely.",
+          "fix": "Close the string literal and complete the function: `print(\"\\nBatch complete! Fetching results.\")`, then add the results-fetching loop, e.g. `for result in client.messages.batches.results(batch.id): ...`, plus a break statement to exit the polling loop."
+        },
+        {
+          "severity": "HIGH",
+          "location": "Batch polling loop (for i in range(max_polls))",
+          "description": "When `processing_status == 'ended'`, the code prints a completion message but never calls `break`. Even if the truncation were fixed, the loop would continue polling after completion. Additionally, if the batch does not finish within `max_polls * 5s = 120s`, there is no warning or error \u2014 the script silently exits without results.",
+          "fix": "Add `break` after handling the 'ended' state, and add an else-clause on the for-loop: `else: print('WARNING: batch did not complete within polling window; save batch.id and retry later.')`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Top-level script (entire file)",
+          "description": "All logic executes at module import time with no `if __name__ == '__main__':` guard. This makes the code untestable and causes side-effectful API calls (and charges) on any accidental import.",
+          "fix": "Wrap all executable statements in `if __name__ == '__main__': main()` and define a `main()` function (or at minimum two feature functions `demo_prompt_caching()` and `demo_batch_api()`)."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Cost comparison block (normal_cost / cached_cost calculation)",
+          "description": "`normal_cost` is derived from `r_no_cache.usage.input_tokens`, which includes the user-message tokens, not just the system prompt tokens. This slightly overstates the non-caching cost. More importantly, `cached_cost` uses only `cache_read_input_tokens` and ignores the non-cached input tokens still charged at full price, understating the real cached call cost and inflating the stated savings percentage.",
+          "fix": "Compute full cost for each call: `cached_cost = (r_cache2.usage.input_tokens / 1_000_000) * 3.00 + (getattr(r_cache2.usage, 'cache_read_input_tokens', 0) / 1_000_000) * 0.30 + (getattr(r_cache2.usage, 'cache_creation_input_tokens', 0) / 1_000_000) * 3.75` to give an accurate comparison."
+        },
+        {
+          "severity": "LOW",
+          "location": "LONG_SYSTEM_PROMPT (line ~14)",
+          "description": "The prompt is doubled with `* 2` solely to inflate token count for demonstration. This is misleading in example/tutorial code because it doubles API cost for the reader and teaches a bad pattern without explanation.",
+          "fix": "Remove `* 2` and instead comment: `# In production this would be your actual large system prompt (10k+ tokens)`."
+        }
+      ],
+      "strengths": [
+        "Clear educational structure with well-labelled sections and inline cost math that makes the business case for each feature immediately tangible.",
+        "Correct use of cache_control ephemeral breakpoint in the system array format \u2014 this is a subtle API detail that is easy to get wrong.",
+        "Safe use of getattr with defaults for cache token fields, gracefully handling SDK versions that may not expose those attributes.",
+        "The batch request payload structure (custom_id + params) is correctly formed per the Anthropic Batch API schema."
+      ],
+      "one_line_summary": "Valuable demo code with a fatal truncation/syntax error and a broken polling loop that must be fixed before it can run end-to-end."
+    }
+  },
+  {
+    "file": "multi_turn.py",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "conversation_history (module-level)",
+          "description": "conversation_history is a mutable global variable that the chat() function closes over and mutates directly. This creates hidden state coupling, makes the function non-reusable for multiple simultaneous conversations, and makes testing impossible without resetting global state.",
+          "fix": "Refactor chat() to accept and return the history explicitly: `def chat(user_message, history): ... return assistant_reply, history` or encapsulate into a class with self.history."
+        },
+        {
+          "severity": "HIGH",
+          "location": "chat(), line accessing response.content[0].text",
+          "description": "No guard against empty content list or unexpected stop reasons (e.g., stop_reason == 'max_tokens'). If the response is truncated or malformed, an IndexError or garbled text gets silently appended to history, corrupting all future turns.",
+          "fix": "Add: `if not response.content: raise ValueError(f'Empty response, stop_reason={response.stop_reason}')` before accessing content[0]. Also check `response.stop_reason != 'max_tokens'` and warn the user when the reply was cut off."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "chat(), API call block",
+          "description": "No error handling around client.messages.create(). Network failures, rate-limit errors (429), or authentication errors will raise unhandled exceptions and leave conversation_history in an inconsistent state \u2014 the user message was already appended but no assistant reply follows, breaking the alternating role invariant.",
+          "fix": "Wrap the API call in try/except, and roll back the appended user message on failure: `conversation_history.pop()` in the except block before re-raising."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Demo 1, model name string",
+          "description": "The model identifier 'claude-sonnet-4-6' is hard-coded in three separate places (two in Demo 1, one in chat()). A model name change or typo requires hunting down every occurrence.",
+          "fix": "Define `MODEL = 'claude-sonnet-4-6'` once at the top of the file and reference it everywhere: `model=MODEL`."
+        },
+        {
+          "severity": "LOW",
+          "location": "print statement before final chat() call, line ~68",
+          "description": "The printed user message ('Write me a function that matches my style.') does not match the actual message sent to the API ('Write me a function that sorts a list of names.'). This is a misleading inconsistency, especially in a demo meant to teach correct behavior.",
+          "fix": "Align both strings: change the print to `print('\\nYou: Write me a function that sorts a list of names.')` to match the argument passed to chat()."
+        }
+      ],
+      "strengths": [
+        "Excellent pedagogical structure \u2014 the three-demo layout clearly illustrates the stateless-vs-stateful contrast for learners.",
+        "Correctly appends both user and assistant turns to history, preserving the required alternating role format the API expects.",
+        "Printing token usage per turn is a good habit that helps users understand context-window growth.",
+        "The history inspection in Demo 3 adds real educational value by making the hidden data structure visible."
+      ],
+      "one_line_summary": "Good teaching demo undermined by mutable global state, no error handling, and a misleading mismatched print statement."
+    }
+  },
+  {
+    "file": "system_prompt.py",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "DEMO 2 \u2014 json.loads(raw) at line 52",
+          "description": "json.loads() will raise an unhandled JSONDecodeError if the model returns anything other than pure JSON (e.g., markdown code fences, a leading explanation, or a partial response due to max_tokens being hit). With max_tokens=512 and a multi-field JSON schema, truncation is a real risk.",
+          "fix": "Wrap the parse in a try/except and consider using Anthropic's tool-use / structured-output feature instead of prompt-engineering JSON, which is more reliable. At minimum: try:\n    parsed = json.loads(raw)\nexcept json.JSONDecodeError as e:\n    print(f'Failed to parse JSON: {e}\\nRaw: {raw}')\n    raise"
+        },
+        {
+          "severity": "HIGH",
+          "location": "DEMO 2 \u2014 parsed['score'], parsed['verdict'], parsed['issues'] at lines 54\u201356",
+          "description": "Direct dict key access without validation will throw a KeyError if any field is missing from the model's response. There is also no type validation (e.g., 'score' could be a string instead of a number).",
+          "fix": "Use parsed.get() with sensible defaults, or validate the schema with a library such as pydantic: score = parsed.get('score'); assert isinstance(score, (int, float)), 'score must be numeric'"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "DEMO 3 \u2014 for loop, line 68",
+          "description": "All three persona API calls are made sequentially with no error handling. A single transient network error or rate-limit response will crash the entire demo and produce no output for the remaining personas.",
+          "fix": "Wrap each call in a try/except block, or use a retry helper (e.g., tenacity). At minimum catch anthropic.APIError so the loop can continue: try:\n    response = client.messages.create(...)\nexcept anthropic.APIError as e:\n    print(f'[{name}] API error: {e}')\n    continue"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Module level \u2014 line 4",
+          "description": "The Anthropic client is instantiated at import time with no explicit API key, relying silently on ANTHROPIC_API_KEY being set in the environment. If the variable is absent the error surfaces late (at the first API call) with an unhelpful traceback.",
+          "fix": "Fail fast with a clear message:\nimport os\napi_key = os.environ.get('ANTHROPIC_API_KEY')\nif not api_key:\n    raise EnvironmentError('ANTHROPIC_API_KEY environment variable is not set')\nclient = anthropic.Anthropic(api_key=api_key)"
+        },
+        {
+          "severity": "LOW",
+          "location": "DEMO 1 \u2014 system string, line 18",
+          "description": "The system prompt uses a backslash line continuation inside a string literal. This is fragile (a trailing space after \\ silently breaks it) and harder to read than an implicit string concatenation or a triple-quoted string.",
+          "fix": "Use a triple-quoted string for consistency with DEMO 2:\nsystem=\"\"\"You are a senior Python developer with 10 years experience.\nYou review code brutally and honestly. You always find at least 3 issues.\nKeep responses under 150 words.\"\"\""
+        }
+      ],
+      "strengths": [
+        "Clear section headers with separators make the demo flow easy to follow",
+        "Good progression from simple to complex: role assignment \u2192 structured output \u2192 multi-persona comparison",
+        "Correctly accesses response.content[0].text rather than assuming a simpler response shape",
+        "Concise and readable \u2014 appropriate for a teaching/demo script"
+      ],
+      "one_line_summary": "Decent demo code, but unhandled JSON parse failures and missing error handling around every API call make it brittle for anything beyond a happy-path run."
+    }
+  },
+  {
+    "file": "buggy.py",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "calculate_average(), line 3",
+          "description": "Returning 0 for an empty list is semantically incorrect and misleading. The average of an empty set is mathematically undefined, not zero. This can cause silent bugs in downstream calculations (e.g., averaging averages).",
+          "fix": "Raise a ValueError or return None: `if not numbers: raise ValueError('Cannot calculate average of an empty sequence')`. If None is preferred, document it explicitly and handle at call sites."
+        },
+        {
+          "severity": "HIGH",
+          "location": "calculate_average(), line 6",
+          "description": "No type validation on list elements. Non-numeric values (e.g., strings, None) will raise a cryptic TypeError inside the loop with no helpful context for the caller.",
+          "fix": "Add a type guard before or inside the loop: `if not all(isinstance(n, (int, float)) for n in numbers): raise TypeError('All elements must be numeric')`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "calculate_average(), lines 4-6",
+          "description": "Manual summation loop is unnecessary and less readable. Python's built-in `sum()` is idiomatic, more readable, and faster for this use case.",
+          "fix": "Replace the loop with: `return sum(numbers) / len(numbers)`"
+        },
+        {
+          "severity": "LOW",
+          "location": "calculate_average()",
+          "description": "No docstring or type annotations are present. This reduces maintainability and IDE support, especially for a utility function likely used in multiple places.",
+          "fix": "Add a type-annotated docstring: `def calculate_average(numbers: list[float]) -> float:` with a docstring describing parameters, return value, and exceptions raised."
+        }
+      ],
+      "strengths": [
+        "Correctly handles the empty list edge case with an explicit guard clause",
+        "Function is small, single-purpose, and easy to reason about",
+        "Includes basic usage examples via print statements for quick manual testing"
+      ],
+      "one_line_summary": "Functional but fragile utility with a semantically incorrect empty-list return value, missing input validation, and non-idiomatic summation logic."
+    }
+  },
+  {
+    "file": "first_call.mjs",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "JavaScript (ESM .mjs)",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "line 13 - response.content[0].text",
+          "description": "No validation that response.content exists, is non-empty, or that content[0] is a text block. If the response is empty or the first block is of type 'tool_use' or other non-text type, this will throw a TypeError at runtime.",
+          "fix": "Add a guard: `const block = response.content.find(b => b.type === 'text'); if (!block) throw new Error('No text block in response'); console.log(block.text);`"
+        },
+        {
+          "severity": "HIGH",
+          "location": "lines 5-16 - top-level await",
+          "description": "The top-level await has no try/catch. Any API error (network failure, auth error, rate limit, timeout) will produce an unhandled promise rejection with no user-friendly message or recovery path.",
+          "fix": "Wrap the entire block in try/catch: `try { const response = await client.messages.create(...); ... } catch (err) { console.error('API call failed:', err.message); process.exit(1); }`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "line 5 - model: \"claude-sonnet-4-6\"",
+          "description": "The model name 'claude-sonnet-4-6' is hardcoded as a magic string inline. If Anthropic deprecates or renames this model, the failure point is buried inside the call with no clear config surface.",
+          "fix": "Extract to a named constant at the top of the file: `const MODEL = 'claude-sonnet-4-6';` and reference it in the call. Optionally allow override via environment variable: `process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6'`."
+        },
+        {
+          "severity": "LOW",
+          "location": "lines 14-17 - metadata logging",
+          "description": "stop_reason is logged but not acted upon. A stop_reason of 'max_tokens' silently indicates a truncated response, which could mislead consumers of this script.",
+          "fix": "Add a warning: `if (response.stop_reason === 'max_tokens') console.warn('Warning: response was truncated due to max_tokens limit.');`"
+        }
+      ],
+      "strengths": [
+        "Clean, minimal structure appropriate for a simple SDK usage example",
+        "Uses ESM top-level await correctly for a .mjs module",
+        "Logs all three useful metadata fields (token counts and stop reason) which is good practice for observability"
+      ],
+      "one_line_summary": "Functional but fragile: missing error handling and response validation make this unsuitable for any production or shared-script use."
+    }
+  },
+  {
+    "file": "multi_turn.mjs",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "JavaScript (ESM / .mjs)",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "conversationHistory.forEach() callback, line ~83",
+          "description": "msg.content.substring(0, 60) assumes content is always a string. The Anthropic SDK can return content as an array of content blocks (e.g., [{type: 'text', text: '...'}]), which would cause substring() to return 'undefined' or throw a TypeError at runtime.",
+          "fix": "Normalize content before calling substring: `const text = Array.isArray(msg.content) ? msg.content.map(b => b.text ?? '').join('') : msg.content; const preview = text.substring(0, 60).replace(/\\n/g, ' ');`"
+        },
+        {
+          "severity": "HIGH",
+          "location": "chat() function, line ~48 and ~56",
+          "description": "There is no error handling around the API call. If the API returns a non-text content block (e.g., tool_use), response.content[0].text will be undefined, and the undefined value gets pushed into conversationHistory, silently corrupting all future turns.",
+          "fix": "Guard with a type check and wrap in try/catch: `const block = response.content.find(b => b.type === 'text'); if (!block) throw new Error('No text block in response'); const reply = block.text;`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Top-level await calls (lines ~16, ~22)",
+          "description": "The DEMO 1 API calls have no error handling. A network error or API failure will produce an unhandled promise rejection and crash the whole script with no useful context.",
+          "fix": "Wrap each demo section in a try/catch block, or add a top-level `.catch()` handler: `try { const r1 = await client.messages.create(...); ... } catch (err) { console.error('DEMO 1 failed:', err.message); }`"
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Module-level / global scope",
+          "description": "conversationHistory is a module-level mutable array with no isolation. In any environment where this module might be imported or re-executed (e.g., test runners, hot-reload), history bleeds across runs. The demo also hardcodes a real user name in plaintext.",
+          "fix": "Encapsulate state inside a class or factory function: `function createSession() { const history = []; return { chat: async (msg) => { ... } }; }` This also makes the code trivially testable."
+        },
+        {
+          "severity": "LOW",
+          "location": "chat() function, line ~35",
+          "description": "The model string 'claude-sonnet-4-6' is repeated three times across the file (lines ~16, ~22, ~38) with no shared constant, making it easy to accidentally use different models in different demos or forget to update all occurrences.",
+          "fix": "Define a single constant at the top: `const MODEL = 'claude-sonnet-4-6';` and reference it everywhere."
+        }
+      ],
+      "strengths": [
+        "Clear pedagogical structure with three distinct demos that progressively build on each other.",
+        "Token usage is logged per turn, which is good practice for cost-awareness demos.",
+        "Correctly appends both user and assistant turns to history before the next call, which is the right pattern for stateful conversation."
+      ],
+      "one_line_summary": "Good demo concept but has a latent type-safety bug with content blocks that will cause silent data corruption, and lacks any error handling throughout."
+    }
+  },
+  {
+    "file": "advanced_api.mjs",
+    "score": 6,
+    "data": {
+      "score": 6,
+      "verdict": "REQUEST_CHANGES",
+      "language": "JavaScript (ESM / .mjs)",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "Batch polling loop, lines ~90-110",
+          "description": "Results are fetched inside the polling loop but `done` is never set to `true` until after the `for await` completes. If `client.messages.batches.results()` throws or the batch ends with all requests errored (processing_status === 'ended' but succeeded === 0), the loop still exits cleanly, silently swallowing failures. More critically, the 24-iteration cap (24 \u00d7 5 s = 120 s) may be far too short for large real-world batches, and there is no notification to the caller that the timeout was hit \u2014 execution simply falls through.",
+          "fix": "After the loop, check `if (!done) throw new Error('Batch timed out after 2 min')`. Also handle non-succeeded results: add an `else` branch inside the results loop for `result.result.type === 'errored'` to log or surface the error."
+        },
+        {
+          "severity": "HIGH",
+          "location": "callClaudeProduction(), lines ~125-148",
+          "description": "After exhausting all retries the last retry attempt's error is never thrown \u2014 `lastError` can still be `undefined` if the very first attempt hits a non-retryable branch that falls through (the logic allows `attempt` to increment without assigning `lastError` when an AuthenticationError is re-thrown, but the retry path itself is fine). More subtly, a successful final attempt returns inside the loop, but an unsuccessful final attempt does NOT throw inside the loop \u2014 it exits and then hits `throw new Error(...)` with `lastError` potentially stringifying to `[object Object]`, losing the original stack.",
+          "fix": "Replace the final throw with `throw lastError ?? new Error('Failed after max retries')` to preserve the original error type and stack. Alternatively, throw inside the loop on the last attempt: `if (attempt === maxRetries - 1) throw e;`."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Cost calculation, lines ~62-65",
+          "description": "The cost comparison is misleading and mathematically incomplete. `normalCost` is computed from `r1` input tokens only, ignoring the cached-write surcharge on `r2` (cache writes cost more than normal input tokens). `cachedCost` only accounts for the cache-read tokens of `r3` and omits the non-cached portion of `r3`'s input tokens and the one-time cache-creation cost of `r2`. This produces a false savings figure.",
+          "fix": "Calculate total cost for the caching scenario as: `(r2.usage.cache_creation_input_tokens / 1e6 * 3.75) + (r2.usage.input_tokens / 1e6 * 3.00) + (r3.usage.cache_read_input_tokens / 1e6 * 0.30) + (r3.usage.input_tokens / 1e6 * 3.00)` and compare against `2 * normalCost` (two uncached calls)."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "LONG_SYSTEM definition, lines ~18-28",
+          "description": "The system prompt is constructed with `.repeat(3)` purely to make it large enough to trigger caching. This is fine for a demo but the resulting prompt contains contradictory/duplicate company standards and a malformed JSON schema repeated three times. If this pattern is copied into production, the duplicated instructions can confuse the model and inflate costs unnecessarily.",
+          "fix": "Use a comment like `// Artificially padded for caching demo \u2014 replace with real long context in production` and pad with neutral filler text (e.g., a long style guide excerpt) rather than tripling the instruction block."
+        },
+        {
+          "severity": "LOW",
+          "location": "Top-level await throughout the file",
+          "description": "All three features run sequentially at the top level with no isolation. A failure in Feature 1 or 2 will prevent Feature 3 from running, making it hard to use individual sections standalone or in tests.",
+          "fix": "Wrap each feature in its own `async function` (e.g., `async function demonstratePromptCaching()`) and call them sequentially in a `main()` function with individual try/catch blocks so each demo is independently runnable and failures are scoped."
+        }
+      ],
+      "strengths": [
+        "Correct use of `cache_control: { type: 'ephemeral' }` on the system block and consistent re-use of the identical prompt to actually trigger a cache hit on the second call.",
+        "Exponential backoff with jitter in `callClaudeProduction` is well-implemented and correctly differentiates retryable vs. non-retryable error types.",
+        "Proactive token counting before sending (`client.messages.countTokens`) is a good production practice and is demonstrated cleanly.",
+        "Batch result iteration uses `for await...of` correctly and includes a try/catch around JSON parsing to handle non-JSON model responses gracefully."
+      ],
+      "one_line_summary": "Solid demo structure with good caching and retry patterns, but the batch timeout handling, error propagation on exhausted retries, and misleading cost calculation all need fixes before this could serve as a reliable production reference."
+    }
+  },
+  {
+    "file": "prompt_engineering.py",
+    "score": 7,
+    "data": {
+      "score": 7,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "json.loads() except block, line 67",
+          "description": "Bare `except:` clause silently swallows all exceptions including KeyboardInterrupt, SystemExit, and genuine JSON decode errors. This hides real problems \u2014 if the model returns malformed JSON or an unexpected schema, the code just prints '(JSON parsing skipped)' with no actionable information.",
+          "fix": "Replace `except:` with `except (json.JSONDecodeError, KeyError) as e:` and log the actual error: `print(f'JSON parsing failed: {e}\\nRaw response: {r.content[0].text}')`"
+        },
+        {
+          "severity": "HIGH",
+          "location": "All client.messages.create() calls (lines 17, 28, 55, 80, 95, 109, 125, 148, 163)",
+          "description": "No error handling around any API call. Network failures, rate limiting (429), authentication errors, or malformed responses will raise unhandled exceptions and crash the entire script, losing all prior output.",
+          "fix": "Wrap API calls in try/except blocks catching `anthropic.APIError`, `anthropic.RateLimitError`, and `anthropic.APIConnectionError`, or add a top-level handler. At minimum wrap each technique's block independently so one failure doesn't abort the rest."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Module level / global scope (entire file)",
+          "description": "All logic executes at module import time in global scope. This makes the code untestable, non-reusable, and means the `client` object is a module-level singleton with no dependency injection. The script also has no `if __name__ == '__main__':` guard.",
+          "fix": "Wrap each technique in a named function (e.g., `def demo_technique_1(client):`) and call them from a `main()` function guarded by `if __name__ == '__main__': main()`. Pass the `client` instance as a parameter."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "formats loop, lines 130\u2013143",
+          "description": "The variable name `system` shadows Python's built-in `system` from the `os` module (if ever imported) and is semantically confusing since it holds a prompt string, not a system object. The loop also lacks any error handling, so a single API failure aborts all remaining format demos.",
+          "fix": "Rename the unpacked variable to `system_prompt`: `for fmt_name, system_prompt in formats:` and use `system=system_prompt` in the API call. Add per-iteration error handling."
+        },
+        {
+          "severity": "LOW",
+          "location": "Line 67, `parsed['score']` and `parsed['edge_cases']`",
+          "description": "Direct dict key access without `.get()` will raise `KeyError` if the model returns valid JSON but omits expected keys \u2014 which is plausible since LLM output is non-deterministic. The bare `except` currently hides this but the fix to that issue will expose it.",
+          "fix": "Use `parsed.get('score', 'N/A')` and `parsed.get('edge_cases', [])` and validate the schema before accessing keys, or use a schema validation library like `pydantic`."
+        },
+        {
+          "severity": "LOW",
+          "location": "Line 80, `no_examples` / `with_examples` and throughout",
+          "description": "Model name `claude-sonnet-4-5` is hardcoded as a string literal repeated across 9+ API calls. If the model name needs to change (e.g., for testing or version updates), every call must be updated manually, risking inconsistency.",
+          "fix": "Define `MODEL = 'claude-sonnet-4-5'` as a module-level constant and reference it in all API calls: `model=MODEL`."
+        }
+      ],
+      "strengths": [
+        "Clear pedagogical structure with well-labeled sections \u2014 each technique is isolated and easy to follow",
+        "Good demonstration of contrasting patterns (bad vs good, with vs without) which is effective for teaching",
+        "XML-structured prompt in Technique 2 is a genuinely useful real-world pattern and well-implemented",
+        "Few-shot example in Technique 3 is realistic and demonstrates format conditioning correctly",
+        "The bonus 'all techniques combined' section reinforces the cumulative value of the patterns shown"
+      ],
+      "one_line_summary": "Solid educational demo undermined by bare except clauses, zero API error handling, and untestable global-scope execution."
+    }
+  },
+  {
+    "file": "code_reviewer.py",
+    "score": 7,
+    "data": {
+      "score": 7,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "review_code(), line ~57",
+          "description": "Model name 'claude-sonnet-4-6' is almost certainly a typo or hallucinated identifier. The valid Anthropic model IDs follow patterns like 'claude-3-5-sonnet-20241022' or 'claude-sonnet-4-5'. An invalid model name will cause an APIStatusError at runtime with no clear user-facing explanation.",
+          "fix": "Replace with a verified model ID such as 'claude-opus-4-5' or 'claude-3-5-sonnet-20241022', or better yet read it from an env var: model=os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022')"
+        },
+        {
+          "severity": "HIGH",
+          "location": "review_code(), user_message construction",
+          "description": "Source code injected into XML-like tags without escaping. If the reviewed file contains '</code>' literally (e.g. in a docstring or comment), it breaks the tag structure and may confuse the model's parsing or allow unintended prompt manipulation.",
+          "fix": "Escape closing tags in source before interpolation: source_safe = source.replace('</code>', '<\\/code>'), then use source_safe in the f-string. Alternatively, use a delimiter that cannot appear in source, such as a random UUID boundary."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "read_source_file(), no file size guard",
+          "description": "There is no limit on how large a file can be read. A very large file (e.g. a minified JS bundle or generated file) will be sent to the API verbatim, potentially exceeding context limits, generating large bills, or causing an obscure APIStatusError.",
+          "fix": "Add a size check after opening: content = f.read(); if len(content) > 150_000: print('Error: file exceeds 150 KB limit', file=sys.stderr); sys.exit(1). Tune the limit to the model's context window."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "review_code(), response.content[0].text",
+          "description": "No guard against an empty content list or a non-text content block. If the API ever returns a tool-use block or an empty response, this line throws an unhandled IndexError or AttributeError with no useful message.",
+          "fix": "Add: if not response.content or not hasattr(response.content[0], 'text'): print('Error: unexpected API response structure', file=sys.stderr); sys.exit(1)"
+        },
+        {
+          "severity": "LOW",
+          "location": "print_report(), stdout/stderr split",
+          "description": "The function prints JSON to stdout and the human-readable summary to stderr, which is a good separation, but the function is named 'print_report' with no indication of this dual-output behaviour. A caller compositing output could accidentally capture stderr or miss the JSON.",
+          "fix": "Rename to 'emit_report' or add a docstring explicitly documenting: 'Writes JSON to stdout and human-readable summary to stderr.' Consider also accepting optional file arguments to make it testable."
+        },
+        {
+          "severity": "LOW",
+          "location": "main(), sys.argv handling",
+          "description": "Accepting only a positional filename argument makes the CLI fragile and non-extensible. There is no --help, no --model flag, and no --output flag for redirecting JSON.",
+          "fix": "Replace the manual sys.argv check with argparse: parser = argparse.ArgumentParser(description=__doc__); parser.add_argument('filename'); parser.add_argument('--model', default='claude-3-5-sonnet-20241022'). This gives free --help and makes future flags trivial to add."
+        }
+      ],
+      "strengths": [
+        "Clean separation of concerns across read_source_file, review_code, print_report, and main \u2014 each function has a single clear responsibility",
+        "Comprehensive API error handling covers authentication, rate limits, connection, and generic status errors with actionable user messages",
+        "Stdout stays pure JSON while human-readable output goes to stderr \u2014 correct design for composable CLI tools",
+        "UTF-8 encoding explicitly specified in open(), with a helpful error for binary files",
+        "System prompt is well-structured with clear rules, schema, and a worked example"
+      ],
+      "one_line_summary": "Solid structure and error handling, but a likely invalid model name and missing input sanitisation are runtime hazards that must be fixed before use."
+    }
+  },
+  {
+    "file": "hello.py",
+    "score": 7,
+    "data": {
+      "score": 7,
+      "verdict": "APPROVE",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "LOW",
+          "location": "line 3-4",
+          "description": "Bare top-level print statements with no encapsulating function or guard make the code non-reusable and will execute immediately on import.",
+          "fix": "Wrap logic in a main() function and add an `if __name__ == '__main__': main()` guard."
+        },
+        {
+          "severity": "LOW",
+          "location": "line 4",
+          "description": "`datetime.now()` returns local time with no timezone info, which can be ambiguous or inconsistent across environments.",
+          "fix": "Use `datetime.now(timezone.utc)` (importing `timezone` from `datetime`) to produce an explicit, unambiguous UTC timestamp."
+        }
+      ],
+      "strengths": [
+        "Clean and minimal \u2014 no unnecessary dependencies.",
+        "Uses `strftime` for human-readable, consistently formatted output.",
+        "Standard library only; no external dependencies required."
+      ],
+      "one_line_summary": "Trivial script that works fine for ad-hoc use but lacks a main guard and timezone awareness."
+    }
+  },
+  {
+    "file": "reviewer.py",
+    "score": 7,
+    "data": {
+      "score": 7,
+      "verdict": "REQUEST_CHANGES",
+      "language": "Python",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "review_file(), line ~195",
+          "description": "The file is truncated mid-statement at `if not questi`, cutting off the chat loop and any subsequent functions (e.g., batch folder review referenced in the docstring). The script will fail with a SyntaxError at import time, making it completely unusable.",
+          "fix": "Restore the full source file. The truncated line should likely read `if not question: continue` followed by the Claude API call, response printing, and history append. Also implement the missing `--folder` batch review functionality described in the module docstring."
+        },
+        {
+          "severity": "HIGH",
+          "location": "call_claude(), stream=True branch",
+          "description": "When `stream=True`, the function returns the stream context manager directly without calling `track_cost()`. The caller does call `track_cost(final)` manually, but if the stream branch raises an exception after the context manager is entered, the retry loop re-enters a new `client.messages.stream()` call without ever exiting the previous one, potentially leaking the connection.",
+          "fix": "Do not return the raw context manager from `call_claude`. Instead, handle streaming entirely inside `call_claude` (yield chunks or return the full text + final message), or clearly document that the caller owns the context. At minimum, wrap the stream creation in a try/except inside the `with` block at the call site, not inside `call_claude`."
+        },
+        {
+          "severity": "HIGH",
+          "location": "review_file(), token_check block (~line 155)",
+          "description": "`client.messages.count_tokens()` is called as a separate API round-trip before the actual streaming call, doubling latency for every file review and consuming billable tokens for the count itself, yet the result is only used for a cosmetic print statement.",
+          "fix": "Remove the `count_tokens` pre-flight call. If token estimation is needed, use a local approximation (e.g., `len(code.split()) * 1.3`) or surface the actual input token count from `final.usage.input_tokens` after the stream completes."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "review_file(), unsupported extension check (~line 143)",
+          "description": "When the file extension is not in `SUPPORTED_EXTENSIONS`, the function prints a warning but continues execution instead of stopping. This silently submits unsupported files to the API.",
+          "fix": "Add `return` or `sys.exit(1)` after the warning, or prompt the user to confirm they want to proceed: `if path.suffix not in SUPPORTED_EXTENSIONS: print(...); return`."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "call_claude(), RateLimitError/APIConnectionError handlers",
+          "description": "On the final retry attempt (`attempt == max_retries - 1`), the exception is caught, the wait is performed, and then the loop ends \u2014 falling through to `sys.exit(1)`. This means the last retry sleeps unnecessarily before failing.",
+          "fix": "Only sleep if there are remaining retries: `if attempt < max_retries - 1: time.sleep(wait)` inside each except block."
+        },
+        {
+          "severity": "LOW",
+          "location": "Module-level: session_costs dict (~line 55)",
+          "description": "`session_costs` is a mutable global dict mutated by `track_cost()`. In any future async or multi-threaded batch context this is a race condition. It also makes unit testing `track_cost` impossible without patching globals.",
+          "fix": "Encapsulate cost tracking in a simple dataclass or a `CostTracker` class instance passed explicitly to functions that need it, or at minimum use `threading.Lock()` around mutations if batch mode becomes parallel."
+        }
+      ],
+      "strengths": [
+        "Clear module-level docstring with usage examples covering all three execution modes.",
+        "Correct use of prompt caching via `cache_control: ephemeral` on the system prompt to reduce repeated-call costs.",
+        "Exponential backoff with jitter for RateLimitError and APIConnectionError is production-appropriate.",
+        "Severity-ordered issue rendering in `print_report` with colour-coded emojis improves readability.",
+        "Encoding errors handled gracefully with `errors='replace'` in `path.read_text()`."
+      ],
+      "one_line_summary": "Solid architecture with good retry/caching patterns, but a fatal truncation bug and several medium-severity issues around streaming lifecycle, unnecessary API calls, and silent failure on unsupported files must be fixed before this is production-ready."
+    }
+  },
+  {
+    "file": "streaming.mjs",
+    "score": 7,
+    "data": {
+      "score": 7,
+      "verdict": "REQUEST_CHANGES",
+      "language": "JavaScript (ESM / .mjs)",
+      "issues": [
+        {
+          "severity": "HIGH",
+          "location": "stream1, stream2 (lines 15\u201327, 36\u201350)",
+          "description": "No error handling on any of the four streams. A network error, API rate-limit, or timeout will throw an unhandled promise rejection and crash the process. The event-emitter-based streams (stream3, chatStream) are also missing an 'error' event listener.",
+          "fix": "Wrap each top-level await stream in try/catch blocks, and add s.on('error', (err) => { ... }) for event-emitter-style streams. At minimum add a top-level process.on('unhandledRejection', ...) guard."
+        },
+        {
+          "severity": "HIGH",
+          "location": "chatStream() \u2014 line 96",
+          "description": "fullReply is built from the 'text' event but the assistant turn pushed to conversationHistory may be an empty string if the stream errors out mid-response or if stop_reason is not 'end_turn'. Sending a blank assistant message in subsequent turns will corrupt the conversation history and likely cause an API validation error.",
+          "fix": "Use the return value of finalMessage() to get the authoritative assistant content: const msg = await s.finalMessage(); conversationHistory.push({ role: 'assistant', content: msg.content }); This also correctly handles multi-block content arrays."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "stream3 \u2014 lines 55\u201370",
+          "description": "stream3 is instantiated without await (correct for the event-emitter pattern) but the 'text' listener is registered synchronously after construction. If the SDK starts emitting synchronously or microtask-queued events before the listener is attached, early chunks could be missed, leading to an incomplete fullResponse and incorrect char count.",
+          "fix": "Use the helper pattern consistently: either attach the listener before any await, or use the async iterator pattern (for await...of) with stream3.text() which guarantees no events are missed."
+        },
+        {
+          "severity": "MEDIUM",
+          "location": "Module top-level \u2014 lines 1\u2013100",
+          "description": "All four demos run unconditionally as top-level await statements in a single flat script. Any failure in Demo 1 will abort Demos 2\u20134. There is also no way to run a single demo in isolation.",
+          "fix": "Wrap each demo in its own async function (runDemo1, runDemo2, etc.) and call them sequentially with await, catching errors per-demo so failures are isolated."
+        },
+        {
+          "severity": "LOW",
+          "location": "Lines 14, 35 \u2014 model name",
+          "description": "The model string 'claude-sonnet-4-6' is hard-coded in four separate places. If the model name needs to change, all four must be updated manually.",
+          "fix": "Extract to a named constant at the top of the file: const MODEL = 'claude-sonnet-4-6'; and reference MODEL throughout."
+        }
+      ],
+      "strengths": [
+        "Good progressive demonstration of three distinct streaming patterns (async iterator, event emitter, combined) which makes it effective as educational material.",
+        "Correct use of the event-emitter .on('text') API alongside finalMessage() in Demo 3 \u2014 this is the idiomatic SDK pattern for getting both streamed output and final metadata.",
+        "process.stdout.write() instead of console.log() correctly avoids spurious newlines mid-stream.",
+        "conversationHistory is properly maintained between chatStream() calls, demonstrating real multi-turn context accumulation."
+      ],
+      "one_line_summary": "Solid streaming demo with good SDK pattern coverage, but lacks any error handling and has a subtle conversation-history bug that would corrupt multi-turn state on stream failure."
+    }
+  }
+]
