@@ -359,5 +359,5 @@ IDs must match `^[a-zA-Z0-9_-]{1,64}$` — no file paths or special characters.
 
 ## Author
 
-Built by **Abhijeet** as a hands-on learning project for Anthropic Claude API mastery.  
+Built by **Abhijith JAYAKARA** as a hands-on learning project for Anthropic Claude API mastery.  
 All modules written and tested on Windows 11, Python 3.14, Node.js v24.
