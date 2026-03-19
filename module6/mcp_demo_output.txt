@@ -1,0 +1,35 @@
+==============================================
+ WHAT IS MCP AND WHY IT MATTERS
+ Prepared for: Management Overview
+==============================================
+
+WHAT IS MCP?
+------------
+MCP (Model Context Protocol) is an open standard that lets AI assistants
+like Claude connect directly to your company's tools, databases, and
+services — securely and in real time.
+
+Think of it as a universal plug: instead of building a custom integration
+every time you want AI to talk to Salesforce, GitHub, Slack, or your
+internal systems, MCP provides one consistent interface that works
+everywhere.
+
+WHY IT MATTERS TO US?
+---------------------
+Without MCP, AI answers questions only from its training data — which
+goes stale and lacks your company's context.
+
+With MCP, the AI can:
+  • Pull live data from your systems before responding
+  • Take real actions (create tickets, query databases, send reports)
+  • Work across multiple tools in a single workflow
+
+BOTTOM LINE
+-----------
+MCP turns AI from a smart chatbot into a connected business tool.
+It reduces custom engineering effort, speeds up AI adoption, and ensures
+the AI always works with current, relevant information.
+
+==============================================
+ Generated via: claude-mastery / module6
+==============================================
